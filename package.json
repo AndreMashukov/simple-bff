@@ -1,0 +1,30 @@
+{
+  "name": "simple-bff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "package:dev": "sls package --stage dev --region ap-southeast-1",
+    "package:prod": "sls package --stage prod --region ap-southeast-1",
+    "deploy:dev": "sls deploy --stage dev --region ap-southeast-1",
+    "deploy:prod": "sls deploy --stage prod --region ap-southeast-1",
+    "info": "sls info --stage dev --region ap-southeast-1",
+    "logs": "sls logs --function hello --stage dev --region ap-southeast-1 --tail",
+    "test:user": "node scripts/create-user-and-test.mjs"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.12.7",
+    "esbuild": "^0.21.5",
+    "serverless": "^4.0.0",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudformation": "^3.1070.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1070.0",
+    "@aws-sdk/client-dynamodb": "^3.1070.0",
+    "@aws-sdk/client-eventbridge": "^3.1070.0",
+    "@aws-sdk/lib-dynamodb": "^3.1070.0"
+  }
+}
