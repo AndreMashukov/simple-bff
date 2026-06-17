@@ -64,10 +64,10 @@ async function processRecord(record: SQSRecord): Promise<void> {
   //   { "version": "0", "id": "...", "detail-type": "...",
   //     "source": "...", "account": "...", "time": "...",
   //     "region": "...", "resources": [...], "detail": { ... } }
-  // Our rule sets InputPath: $.detail, so record.body is JUST the
-  // detail object. We accept both shapes: if body has a `source`
-  // and `detail` it's the full envelope; otherwise it's already the
-  // unwrapped detail.
+  // Our rule sets InputPath: "$" (the whole envelope), so record.body
+  // is the full EventBridge event. We accept both shapes defensively:
+  // if body has a `source` and `detail` it's the envelope; otherwise
+  // it's already the unwrapped detail.
   const body = JSON.parse(record.body) as Record<string, unknown>;
 
   const source = (body.source as string) ?? "<unknown-source>";
@@ -75,38 +75,65 @@ async function processRecord(record: SQSRecord): Promise<void> {
     (body["detail-type"] as string) ?? "<unknown-detail-type>";
   const time = (body.time as string) ?? new Date().toISOString();
   const detail = (body.detail as Record<string, unknown>) ?? body;
+  const eventId = (body.id as string) ?? record.messageId;
   const entityId =
     (detail.id as string) ||
     (detail.entityId as string) ||
     (detail["detail-id"] as string) ||
-    record.messageId;
+    eventId;
 
+  // sk includes eventId so two events for the same (source, entity) at
+  // the same ISO timestamp do not collide. The (pk, sk) tuple is what
+  // makes the projection unique; if the same upstream event is
+  // delivered twice (SQS at-least-once), the conditional Put below
+  // turns the second write into a no-op rather than an overwrite.
   const item = {
     pk: `${source}#${entityId}`,
-    sk: time,
+    sk: `${time}#${eventId}`,
     discriminator: source,
     source,
     detailType,
     time,
     detail,
     receivedAt: new Date().toISOString(),
-    eventId: (body.id as string) ?? record.messageId,
+    eventId,
   };
 
-  await ddb.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: item,
-    }),
-  );
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: TABLE_NAME,
+        Item: item,
+        // Idempotency: only write if (pk, sk) is new. Duplicate
+        // deliveries (same upstream event re-driven by SQS) become a
+        // no-op instead of an overwrite that would later emit a
+        // spurious MODIFY on the stream.
+        ConditionExpression:
+          "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+      }),
+    );
 
-  log("info", "event projected", {
-    messageId: record.messageId,
-    pk: item.pk,
-    sk: item.sk,
-    source,
-    detailType,
-  });
+    log("info", "event projected", {
+      messageId: record.messageId,
+      pk: item.pk,
+      sk: item.sk,
+      source,
+      detailType,
+    });
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      err.name === "ConditionalCheckFailedException"
+    ) {
+      log("info", "event already projected", {
+        messageId: record.messageId,
+        pk: item.pk,
+        sk: item.sk,
+      });
+      return;
+    }
+    throw err;
+  }
 }
 
 function log(

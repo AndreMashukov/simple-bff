@@ -39,9 +39,17 @@ export const handle: DynamoDBStreamHandler = async (event) => {
     recordCount: event.Records.length,
   });
 
-  const entries = event.Records.map(buildEntry).filter(<T>(x: T | null): x is T => x !== null);
+  // Pair each surviving record with its EventBridge entry so we keep
+  // the (record, entry) correspondence when chunking. If buildEntry
+  // ever returns null the pair is dropped together -- slicing
+  // event.Records separately from entries would misalign the indices
+  // used for batchItemFailures reporting.
+  const items = event.Records.flatMap((record) => {
+    const entry = buildEntry(record);
+    return entry ? [{ record, entry }] : [];
+  });
 
-  if (entries.length === 0) {
+  if (items.length === 0) {
     log("info", "trigger done (no entries)", { succeeded: 0, failed: 0 });
     return { batchItemFailures: [] };
   }
@@ -50,36 +58,42 @@ export const handle: DynamoDBStreamHandler = async (event) => {
   const CHUNK = 10;
   const failures: { itemIdentifier: string }[] = [];
 
-  for (let i = 0; i < entries.length; i += CHUNK) {
-    const slice = entries.slice(i, i + CHUNK);
-    // Map slice indices back to the original record's eventID for
-    // partial-failure reporting. We rely on entries.length ===
-    // event.Records.length here (filter only drops nulls, which we
-    // never produce -- see buildEntry).
-    const recordSlice = event.Records.slice(i, i + CHUNK);
+  for (let i = 0; i < items.length; i += CHUNK) {
+    const slice = items.slice(i, i + CHUNK);
     try {
       const result = await eb.send(
         new PutEventsCommand({
-          Entries: slice,
+          Entries: slice.map(({ entry }) => entry),
         }),
       );
 
       const failedCount = result.FailedEntryCount ?? 0;
       if (failedCount > 0) {
-        // PutEvents does not tell us WHICH entries failed when there
-        // are partial failures -- it returns the full list and a count.
-        // Conservative: report the whole chunk as failed so the next
-        // invocation retries. Idempotency is provided downstream by
-        // the listener's pk/sk design (Put is idempotent on the same
-        // item) and the bus's at-least-once semantics.
-        for (const r of recordSlice) {
-          failures.push({ itemIdentifier: r.eventID ?? r.dynamodb?.SequenceNumber ?? "unknown" });
+        // PutEvents returns per-entry ErrorCode/ErrorMessage in
+        // result.Entries (same order as the request). When the SDK
+        // reports only a count with no per-entry details (rare, e.g.
+        // throttling), fall back to retrying the whole chunk.
+        const failedIndexes = (result.Entries ?? [])
+          .map((entryResult, idx) => (entryResult.ErrorCode ? idx : -1))
+          .filter((idx) => idx >= 0);
+        const retryIndexes =
+          failedIndexes.length > 0 ? failedIndexes : slice.map((_, idx) => idx);
+
+        for (const idx of retryIndexes) {
+          // idx came from a .map or .filter over `slice` itself, so
+          // it is bounded by slice.length; non-null assertion is safe
+          // (and the alternative is two lookups per index for no gain).
+          const item = slice[idx]!;
+          failures.push({ itemIdentifier: streamItemIdentifier(item.record) });
         }
+        const firstError = result.Entries?.find((e) => e.ErrorMessage);
+        const firstCode = result.Entries?.find((e) => e.ErrorCode);
         log("error", "trigger PutEvents partial failure", {
           failedCount,
           chunkSize: slice.length,
-          firstError: result.Entries?.[0]?.ErrorMessage,
-          firstCode: result.Entries?.[0]?.ErrorCode,
+          retrying: retryIndexes.length,
+          firstError: firstError?.ErrorMessage,
+          firstCode: firstCode?.ErrorCode,
         });
       } else {
         log("info", "trigger chunk ok", { chunkSize: slice.length });
@@ -89,8 +103,8 @@ export const handle: DynamoDBStreamHandler = async (event) => {
         error: err instanceof Error ? err.message : String(err),
         chunkSize: slice.length,
       });
-      for (const r of recordSlice) {
-        failures.push({ itemIdentifier: r.eventID ?? r.dynamodb?.SequenceNumber ?? "unknown" });
+      for (const { record } of slice) {
+        failures.push({ itemIdentifier: streamItemIdentifier(record) });
       }
     }
   }
@@ -171,6 +185,23 @@ function buildEntry(rec: DynamoDBRecord): {
     // future maintainer attaches a resource policy that allows it.
     EventBusName: EVENT_BUS_NAME,
   };
+}
+
+/**
+ * Lambda's ReportBatchItemFailures contract for DynamoDB streams
+ * requires itemIdentifier to be the record's SequenceNumber so the
+ * shard iterator can resume correctly on retry. The optional
+ * `eventID` field is a UUID useful for logging but is NOT what
+ * the runtime expects here.
+ */
+function streamItemIdentifier(record: DynamoDBRecord): string {
+  const sequenceNumber = record.dynamodb?.SequenceNumber;
+  if (!sequenceNumber) {
+    throw new Error(
+      `DynamoDB stream record missing SequenceNumber: ${record.eventID ?? "<unknown>"}`,
+    );
+  }
+  return sequenceNumber;
 }
 
 function log(
