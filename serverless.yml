@@ -261,7 +261,7 @@ resources:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-${self:provider.stage}-listener
-        VisibilityTimeout: 60
+        VisibilityTimeout: 180
         MessageRetentionPeriod: 1209600
         RedrivePolicy:
           deadLetterTargetArn:

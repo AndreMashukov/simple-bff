@@ -66,9 +66,12 @@ async function handleEvents(
   body: string;
 }> {
   const claims = authEvent.requestContext.authorizer?.jwt.claims;
-  const sub = claims?.sub ?? "unknown";
+  // Drop sub from structured log: it is a persistent user identifier and
+  // we do not need it to correlate /events traffic. The HTTP response
+  // body still includes it (it is the caller’s own identity).
+  const hasSub = typeof claims?.sub === "string" && claims.sub.length > 0;
 
-  log("info", "/events invoked", { sub, table: TABLE_NAME });
+  log("info", "/events invoked", { authed: hasSub, table: TABLE_NAME });
 
   const result = await ddb.send(
     new ScanCommand({
