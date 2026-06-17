@@ -1,0 +1,409 @@
+# Simple BFF — Serverless Framework v4
+# Single Lambda behind an API Gateway HTTP API (v2), protected by a
+# Cognito User Pool JWT authorizer. Includes a Cognito Hosted UI
+# domain so you can log in via browser and grab a real JWT for
+# testing.
+#
+# To deploy:
+#   1. Register at https://app.serverless.com (free for under 2M USD/yr)
+#   2. Create an access key, export SERVERLESS_ACCESS_KEY=<the key>
+#   3. sls deploy --stage dev --region ap-southeast-1
+#
+# After deploy, the stack outputs will print:
+#   HttpApiUrl          — base URL of the API
+#   UserPoolId          — Cognito User Pool id
+#   UserPoolClientId    — App client id
+#   HostedUiUrl         — browser login URL
+#   CallbackUrl         — must match this in the App Client settings
+
+service: simple-bff
+
+frameworkVersion: ^4
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ap-southeast-1
+  stage: ${opt:stage, 'dev'}
+  endpointType: REGIONAL
+  logRetentionInDays: ${opt:logRetentionInDays, 3}
+  environment:
+    STAGE: ${self:provider.stage}
+    PROJECT: simple-bff
+    EVENT_BUS_NAME:
+      Fn::GetAtt: [EventBus, Name]
+    LISTENER_QUEUE_URL:
+      Ref: ListenerQueue
+    ENTITIES_TABLE:
+      Ref: EntitiesTable
+    ENTITIES_TABLE_STREAM_ARN:
+      Fn::GetAtt: [EntitiesTable, StreamArn]
+  # No deploymentRole / permissionsBoundary — keeping this stack simple.
+  # Shared IAM statements for every function. Per-function overrides
+  # below add DynamoDB table access.
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+          Resource:
+            - Fn::GetAtt: [EntitiesTable, Arn]
+            - Fn::Join:
+                - '/'
+                - - Fn::GetAtt: [EntitiesTable, Arn]
+                  - index
+                  - '*'
+  httpApi:
+    authorizers:
+      cognitoJwtAuthorizer:
+        type: jwt
+        identitySource: '$request.header.Authorization'
+        issuerUrl:
+          Fn::Sub: 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+        audience:
+          - !Ref UserPoolClient
+
+stages:
+  default:
+    params:
+      callbackBaseUrl: 'http://localhost:3000'
+      hostedUiDomainPrefix: 'simple-bff-dev'
+  prod:
+    params:
+      callbackBaseUrl: 'https://your-prod-domain.example.com'
+      hostedUiDomainPrefix: 'simple-bff-prod'
+
+custom:
+  cognito:
+    userPoolName: ${self:service}-${self:provider.stage}-users
+    appClientName: ${self:service}-${self:provider.stage}-web
+    hostedUiDomainPrefix: '${param:hostedUiDomainPrefix}'
+    callbackBaseUrl: '${param:callbackBaseUrl}'
+
+build:
+  esbuild:
+    bundle: true
+    minify: false
+    target: 'node20'
+    sourcemap:
+      type: linked
+      setNodeOptions: true
+    external:
+      - '@aws-sdk/*'
+
+functions:
+  hello:
+    handler: src/handler.hello
+    description: GET /hello (JWT-secured greeting) and GET /events (materialized view read from DynamoDB).
+    memorySize: 256
+    timeout: 10
+    events:
+      - httpApi:
+          path: /hello
+          method: get
+          authorizer: cognitoJwtAuthorizer
+      - httpApi:
+          path: /events
+          method: get
+          authorizer: cognitoJwtAuthorizer
+
+  listener:
+    handler: src/listener.handle
+    description: Consumes domain events from the event bus (listener leg of the Trilateral API).
+    memorySize: 256
+    timeout: 30
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [ListenerQueue, Arn]
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+  # Trigger leg of the Trilateral API: DynamoDB stream on EntitiesTable
+  # (CDC) is consumed and re-published as domain events onto the local
+  # bus. The book (Ch. 5) frames this as 'transient events from the
+  # BFF' -- other services subscribe to entity.created / entity.modified
+  # / entity.deleted without coupling to the BFF's storage.
+  trigger:
+    handler: src/trigger.handle
+    description: DynamoDB stream CDC consumer that re-publishes entity changes onto the event bus.
+    memorySize: 256
+    timeout: 30
+    events:
+      - stream:
+          type: dynamodb
+          arn:
+            Fn::GetAtt: [EntitiesTable, StreamArn]
+          batchSize: 100
+          startingPosition: TRIM_HORIZON
+          # Only forward writes/deletes. In our model the listener leg
+          # is the only writer; we want every state change to be
+          # re-published, not just MODIFY.
+          filterPatterns:
+            - eventName: [INSERT, MODIFY, REMOVE]
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    # Cognito User Pool
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: ${self:custom.cognito.userPoolName}
+        AutoVerifiedAttributes:
+          - email
+        MfaConfiguration: 'OFF'
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireLowercase: true
+            RequireUppercase: false
+            RequireNumbers: true
+            RequireSymbols: false
+        UsernameConfiguration:
+          CaseSensitive: false
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+
+    # App client used by the Hosted UI (no client secret — public client
+    # so PKCE / implicit-ish flows work in the browser).
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: simple-bff-dev-client
+        UserPoolId: !Ref UserPool
+        GenerateSecret: false
+        PreventUserExistenceErrors: ENABLED
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_USER_SRP_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+        SupportedIdentityProviders:
+          - COGNITO
+        AllowedOAuthFlows:
+          - code
+        AllowedOAuthScopes:
+          - openid
+          - email
+          - profile
+        AllowedOAuthFlowsUserPoolClient: true
+        CallbackURLs:
+          - !Sub '${self:custom.cognito.callbackBaseUrl}/'
+          - !Sub '${self:custom.cognito.callbackBaseUrl}/oauth2/idpresponse'
+        LogoutURLs:
+          - !Sub '${self:custom.cognito.callbackBaseUrl}/'
+        DefaultRedirectURI: !Sub '${self:custom.cognito.callbackBaseUrl}/'
+
+    # Hosted UI domain
+    UserPoolDomain:
+      Type: AWS::Cognito::UserPoolDomain
+      Properties:
+        UserPoolId: !Ref UserPool
+        Domain: ${self:custom.cognito.hostedUiDomainPrefix}
+
+    # --- Materialized view (Trilateral API: persistence leg) ---
+    # Single-table design per the book (page 55-56): one table per BFF
+    # that caches all entity types as items, differentiated by pk/sk.
+    # pk = source#entityId, sk = eventTime. This shape lets us query
+    # "all events for source X" (Query with pk begins_with) or "all
+    # events in time order" (Scan). The trigger leg (next step) will
+    # also wire a DynamoDB stream on this same table for CDC.
+    EntitiesTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-entities
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: pk
+            AttributeType: S
+          - AttributeName: sk
+            AttributeType: S
+        KeySchema:
+          - AttributeName: pk
+            KeyType: HASH
+          - AttributeName: sk
+            KeyType: RANGE
+        # NEW_AND_OLD_IMAGES is what the trigger leg needs: it gives the
+        # downstream consumer (re-publishing to EventBridge) both the
+        # before/after shape of the row, so it can build entity.created /
+        # entity.modified / entity.deleted events. KEYS_ONLY would lose
+        # the payload; NEW_IMAGE_ONLY would break delete events.
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        SSESpecification:
+          SSEEnabled: true
+
+    # --- Listener leg (Trilateral API: asynchronous listener interface) ---
+    # Custom EventBridge bus. The BFF listens for events on this bus and
+    # projects them (in this read-only scaffold, just logs them). Other
+    # services in the same domain publish to this bus with source prefix
+    # of their service name, e.g. product-catalog.test.
+    EventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-events
+
+    # SQS queue that EventBridge rules target. Lambda pulls from here.
+    ListenerQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-listener
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 1209600
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [ListenerDlq, Arn]
+          maxReceiveCount: 5
+
+    # Dead-letter queue. Messages that fail processing 5x land here.
+    ListenerDlq:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-listener-dlq
+        MessageRetentionPeriod: 1209600
+
+    # Allow EventBridge to send messages into the queue, but only from
+    # the bus in this stack (Condition: aws:SourceArn matches the rule).
+    ListenerQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: ListenerQueue
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt: [ListenerQueue, Arn]
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    Fn::GetAtt: [ListenerRule, Arn]
+
+    # Rule on the custom bus. EventBridge requires EventPattern or
+    # ScheduleExpression on every rule. We match all sources from any
+    # account; tighten the pattern when real upstream services exist.
+    #
+    # InputPath: $ means "pass the whole event through", so the SQS
+    # body includes source, detail-type, time, account, region AND the
+    # detail. The listener expects this envelope shape. If we used
+    # InputPath: $.detail instead, the listener would lose the source
+    # and detail-type metadata and have to invent fallbacks.
+    ListenerRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName:
+          Fn::GetAtt: [EventBus, Name]
+        # Match any event on the bus EXCEPT the BFF's own re-emitted
+        # state-change events. The trigger publishes Source:
+        # "simple-bff.entity" (see src/trigger.ts) when its own
+        # EntitiesTable rows change; if the listener consumed those
+        # it would project them as new rows, the stream would see
+        # those new rows, the trigger would fire again, and so on
+        # — a feedback loop. Tighten the allow-list further when
+        # real upstream services are known.
+        EventPattern:
+          source:
+            - "anything-but":
+                - "simple-bff.entity"
+        State: ENABLED
+        Targets:
+          - Id: ListenerQueueTarget
+            Arn:
+              Fn::GetAtt: [ListenerQueue, Arn]
+            InputPath: "$"
+
+    # Per-function IAM for the listener. SF auto-creates a single shared
+    # IamRoleLambdaExecution for all functions in the service, with the
+    # SQS ReceiveMessage / DeleteMessage / GetQueueAttributes permissions
+    # already attached to the wired queue. We just need to add explicit
+    # DLQ SendMessage access for the redrive target.
+    ListenerRoleStatements:
+      Type: AWS::IAM::Policy
+      Properties:
+        PolicyName: simple-bff-listener-dlq-access
+        Roles:
+          - !Ref IamRoleLambdaExecution
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource:
+                Fn::GetAtt: [ListenerDlq, Arn]
+
+    # Per-function IAM for the trigger. The DynamoDB stream consumer
+    # permission (DescribeStream, GetShardIterator, GetRecords,
+    # ListStreams) is added automatically by Serverless Framework when
+    # the stream event source is wired. We only need to add explicit
+    # EventBridge PutEvents so the trigger can re-publish CDC events
+    # onto the local bus.
+    TriggerRoleStatements:
+      Type: AWS::IAM::Policy
+      Properties:
+        PolicyName: simple-bff-trigger-putevents
+        Roles:
+          - !Ref IamRoleLambdaExecution
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource:
+                Fn::GetAtt: [EventBus, Arn]
+
+  Outputs:
+    UserPoolId:
+      Value: !Ref UserPool
+    UserPoolArn:
+      Value: !GetAtt UserPool.Arn
+    UserPoolClientId:
+      Value: !Ref UserPoolClient
+    HostedUiUrl:
+      Value: !Sub 'https://${self:custom.cognito.hostedUiDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+    CallbackUrl:
+      Value: !Sub '${self:custom.cognito.callbackBaseUrl}/'
+
+    # --- Materialized view outputs ---
+    EntitiesTableName:
+      Value: !Ref EntitiesTable
+    EntitiesTableArn:
+      Value: !GetAtt EntitiesTable.Arn
+
+    # --- Listener leg outputs ---
+    EventBusName:
+      Value:
+        Fn::GetAtt: [EventBus, Name]
+    EventBusArn:
+      Value:
+        Fn::GetAtt: [EventBus, Arn]
+    ListenerQueueUrl:
+      Value:
+        Ref: ListenerQueue
+    ListenerQueueArn:
+      Value:
+        Fn::GetAtt: [ListenerQueue, Arn]
+    ListenerDlqArn:
+      Value:
+        Fn::GetAtt: [ListenerDlq, Arn]
+    ListenerFunctionName:
+      Value: !Ref ListenerLambdaFunction
+    TriggerFunctionName:
+      Value: !Ref TriggerLambdaFunction
+    EntitiesTableStreamArn:
+      Value: !GetAtt EntitiesTable.StreamArn
